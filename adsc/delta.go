@@ -7,6 +7,7 @@ import (
 	"sync"
 	"unique"
 
+	agapi "github.com/agentgateway/agentgateway/api"
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -42,6 +43,8 @@ type (
 	IString    = unique.Handle[string]
 	IStringSet = sets.Set[IString]
 )
+
+var agentgatewayResourceType = typeURL[*agapi.Resource]()
 
 type deltaClient struct {
 	initialWatches []string
@@ -98,6 +101,9 @@ func DialDelta(url string, opts *Config) (ADSClient, error) {
 	}
 	if opts.NodeType == "ztunnel" {
 		c.initialWatches = []string{v3.AddressType, v3.WorkloadAuthorizationType}
+	}
+	if opts.NodeType == "agentgateway" {
+		c.initialWatches = []string{agentgatewayResourceType, v3.AddressType}
 	}
 	go c.handleRecv()
 	return c, nil

@@ -7,6 +7,7 @@ toolchain go1.24.3
 require (
 	github.com/Masterminds/sprig v2.22.0+incompatible
 	github.com/Masterminds/sprig/v3 v3.3.0
+	github.com/agentgateway/agentgateway/api v0.0.0-20260306202740-8ffa38af6bfb
 	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/cncf/udpa/go v0.0.0-20220112060539-c52dc94e7fbe
 	github.com/envoyproxy/go-control-plane v0.13.5-0.20251013064519-48f97e33cb02
@@ -18,7 +19,7 @@ require (
 	go.uber.org/atomic v1.11.0
 	golang.org/x/sync v0.17.0
 	google.golang.org/grpc v1.76.0
-	google.golang.org/protobuf v1.36.10
+	google.golang.org/protobuf v1.36.11
 	istio.io/api v1.28.0-alpha.0.0.20251015201407-f6b4b4f56db2
 	istio.io/client-go v1.28.0-alpha.0.0.20251015201706-99349a9d18ee
 	istio.io/istio v0.0.0-20251015190908-65bd03319f07
