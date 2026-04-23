@@ -18,7 +18,7 @@ func NewGeneric[T controllers.Object](s T) *Generic[T] {
 }
 
 func (v *Generic[T]) Run(ctx model.Context) (err error) {
-	return kube.Apply(ctx.Client, v.Spec)
+	return kube.ApplyRealSSA(ctx.Client, v.Spec)
 }
 
 func (v *Generic[T]) Cleanup(ctx model.Context) error {

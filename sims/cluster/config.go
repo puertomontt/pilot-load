@@ -17,7 +17,9 @@ import (
 // A cluster consists of various namespaces
 type Config struct {
 	// Time between each namespace creation at startup
-	GracePeriod model.Duration    `json:"gracePeriod,omitempty"`
+	GracePeriod model.Duration `json:"gracePeriod,omitempty"`
+	// Number of parallel namespaces to apply
+	Concurrency int               `json:"concurrency,omitempty"`
 	Jitter      JitterConfig      `json:"jitter,omitempty"`
 	Namespaces  []NamespaceConfig `json:"namespaces,omitempty"`
 	Nodes       []NodeConfig      `json:"nodes,omitempty"`

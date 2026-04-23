@@ -25,7 +25,7 @@ func NewServiceAccount(s ServiceAccountSpec) *ServiceAccount {
 }
 
 func (s *ServiceAccount) Run(ctx model.Context) (err error) {
-	return IgnoreExists(kube.Apply(ctx.Client, s.getServiceAccount()))
+	return IgnoreExists(kube.ApplyRealSSA(ctx.Client, s.getServiceAccount()))
 }
 
 func IgnoreExists(err error) error {

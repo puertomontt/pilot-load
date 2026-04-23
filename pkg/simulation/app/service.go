@@ -29,7 +29,7 @@ func NewService(s ServiceSpec) *Service {
 }
 
 func (s *Service) Run(ctx model.Context) (err error) {
-	return kube.Apply(ctx.Client, s.getService())
+	return kube.ApplyRealSSA(ctx.Client, s.getService())
 }
 
 func (s *Service) Cleanup(ctx model.Context) error {

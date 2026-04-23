@@ -12,6 +12,7 @@ import (
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	yamlserializer "k8s.io/apimachinery/pkg/runtime/serializer/yaml"
@@ -23,12 +24,14 @@ func ParseYamlFile(inputFile string) ([]controllers.Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	return ParseYaml(f)
 }
 
 func ParseYaml(r io.Reader) ([]controllers.Object, error) {
 	codecs := serializer.NewCodecFactory(kube.IstioScheme)
 	deserializer := codecs.UniversalDeserializer()
+	unstructuredDeserializer := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
 	reader := yaml.NewYAMLReader(bufio.NewReader(r))
 	resp := []controllers.Object{}
@@ -66,7 +69,11 @@ func ParseYaml(r io.Reader) ([]controllers.Object, error) {
 		} else {
 			obj, _, err = deserializer.Decode(chunk, &gvk, obj)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse message: %v", err)
+				raw := &unstructured.Unstructured{}
+				obj, _, err = unstructuredDeserializer.Decode(chunk, &gvk, raw)
+				if err != nil {
+					return nil, fmt.Errorf("cannot parse message: %v", err)
+				}
 			}
 		}
 

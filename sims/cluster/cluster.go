@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/kubetypes"
@@ -123,6 +124,7 @@ func (c *Cluster) getSims() []model.Simulation {
 }
 
 func (c *Cluster) Run(ctx model.Context) error {
+	t0 := time.Now()
 	// Act as kubelet
 	// TODO: make a leader election mechanism for multi-instance
 	go c.watchPods(ctx)
@@ -140,19 +142,33 @@ func (c *Cluster) Run(ctx model.Context) error {
 	}
 
 	total := len(c.namespaces)
+	g := errgroup.Group{}
+	if c.Spec.Config.Concurrency > 0 {
+		g.SetLimit(c.Spec.Config.Concurrency)
+	} else {
+		g.SetLimit(1)
+	}
 	for i, ns := range c.namespaces {
-		log.Infof("starting namespace %v (%d of %d)", ns.Spec.Name, i+1, total)
-		if err := (model.AggregateSimulation{Simulations: []model.Simulation{ns}}.Run(ctx)); err != nil {
-			return fmt.Errorf("failed to bootstrap namespace: %v", err)
-		}
-		select {
-		case <-time.After(time.Duration(c.Spec.Config.GracePeriod)):
-		case <-ctx.Done():
+		g.Go(func() error {
+			t0 := time.Now()
+			log.Infof("starting namespace %v (%d of %d)", ns.Spec.Name, i+1, total)
+			if err := (model.AggregateSimulation{Simulations: []model.Simulation{ns}}.Run(ctx)); err != nil {
+				return fmt.Errorf("failed to bootstrap namespace: %v", err)
+			}
+			log.Debugf("finished namespace %v (%d of %d) in %v", ns.Spec.Name, i+1, total, time.Since(t0))
+			select {
+			case <-time.After(time.Duration(c.Spec.Config.GracePeriod)):
+			case <-ctx.Done():
+				return nil
+			}
 			return nil
-		}
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
-	log.Infof("cluster %q synced, starting cluster scaler", c.Name)
+	log.Infof("cluster %q synced in %v, starting cluster scaler", c.Name, time.Since(t0))
 	close(c.running)
 	return (&ClusterScaler{Cluster: c}).Run(ctx)
 }

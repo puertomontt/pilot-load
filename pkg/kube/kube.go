@@ -24,6 +24,7 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -142,7 +143,10 @@ func ApplyRealSSA[T controllers.Object](c *Client, o T) error {
 	ns := o.GetNamespace()
 	var patcher func(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) error
 	if !TypeIsConcrete[T]() {
-		cl, _ := dynamicClient(c, o)
+		cl, err := dynamicClient(c, o)
+		if err != nil {
+			return err
+		}
 		patcher = func(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) error {
 			_, err := cl.Patch(ctx, name, pt, data, opts)
 			return err
@@ -155,6 +159,9 @@ func ApplyRealSSA[T controllers.Object](c *Client, o T) error {
 		}
 	}
 	t := ptr.TypeName[T]()
+	if t == "" || t == "<nil>" {
+		t = o.GetObjectKind().GroupVersionKind().Kind
+	}
 
 	buf := &bytes.Buffer{}
 	gv := o.GetObjectKind().GroupVersionKind().GroupVersion()
@@ -229,16 +236,19 @@ func TypeIsConcrete[T any]() bool {
 // Status is not written
 func Create[T controllers.Object](c *Client, o T) (bool, error) {
 	if !TypeIsConcrete[T]() {
-		cl, gvr := dynamicClient(c, o)
-		scope.Debugf("creating resource: %s/%s/%s", gvr, o.GetName(), o.GetNamespace())
-		o := toUnstructured(o)
-		if _, err := cl.Create(context.Background(), o, metav1.CreateOptions{}); err != nil {
+		cl, err := dynamicClient(c, o)
+		if err != nil {
+			return false, err
+		}
+		scope.Debugf("creating resource: %s/%s/%s", o.GetObjectKind().GroupVersionKind(), o.GetName(), o.GetNamespace())
+		u := toUnstructured(o)
+		if _, err := cl.Create(context.Background(), u, metav1.CreateOptions{}); err != nil {
 			if errors.IsAlreadyExists(err) {
-				scope.Debugf("skipped resource, already exists: %s/%s/%s", gvr, o.GetName(), o.GetNamespace())
+				scope.Debugf("skipped resource, already exists: %s/%s/%s", o.GetObjectKind().GroupVersionKind(), o.GetName(), o.GetNamespace())
 				return false, nil
 			}
 			if errors.IsForbidden(err) && strings.Contains(err.Error(), "exceeded quota") {
-				scope.Warnf("skipped resource, exceeded quota: %s/%s/%s", gvr, o.GetName(), o.GetNamespace())
+				scope.Warnf("skipped resource, exceeded quota: %s/%s/%s", o.GetObjectKind().GroupVersionKind(), o.GetName(), o.GetNamespace())
 				return false, nil
 			}
 			return false, fmt.Errorf("create resource: %v", err)
@@ -263,37 +273,57 @@ func Create[T controllers.Object](c *Client, o T) (bool, error) {
 	return true, nil
 }
 
-func dynamicClient[T controllers.Object](c *Client, o T) (dynamic.ResourceInterface, schema.GroupVersionResource) {
-	gvr := toGvr[T](o)
-	raw := c.Dynamic().Resource(gvr)
-	var cl dynamic.ResourceInterface = raw
-	if o.GetNamespace() != "" {
-		cl = raw.Namespace(o.GetNamespace())
+func dynamicClient[T controllers.Object](c *Client, o T) (dynamic.ResourceInterface, error) {
+	u := toUnstructured(o)
+	if u == nil {
+		return nil, fmt.Errorf("convert resource to unstructured: %s/%s/%s", o.GetObjectKind().GroupVersionKind(), o.GetName(), o.GetNamespace())
 	}
-	return cl, gvr
+	gvr, err := toGvr(c, o)
+	if err != nil {
+		return nil, err
+	}
+	raw := c.Dynamic().Resource(gvr)
+	if o.GetNamespace() != "" {
+		return raw.Namespace(o.GetNamespace()), nil
+	}
+	return raw, nil
 }
 
-func toGvr[T controllers.Object](o T) schema.GroupVersionResource {
+func toGvr[T controllers.Object](c *Client, o T) (schema.GroupVersionResource, error) {
 	kk := o.GetObjectKind().GroupVersionKind()
 	ik := config.GroupVersionKind{
 		Group:   kk.Group,
 		Version: kk.Version,
 		Kind:    kk.Kind,
 	}
-	gvr := gvk.MustToGVR(ik)
-	return gvr
+	if gvr, ok := gvk.ToGVR(ik); ok {
+		return gvr, nil
+	}
+	mapper, err := c.Client.(kube.CLIClient).UtilFactory().ToRESTMapper()
+	if err != nil {
+		return schema.GroupVersionResource{}, err
+	}
+	mapping, err := mapper.RESTMapping(kk.GroupKind(), kk.Version)
+	if err == nil {
+		return mapping.Resource, nil
+	}
+	gvr, _ := meta.UnsafeGuessKindToResource(kk)
+	return gvr, nil
 }
 
 func Delete[T controllers.Object](c *Client, o T) error {
 	if !TypeIsConcrete[T]() {
-		cl, gvr := dynamicClient(c, o)
+		cl, err := dynamicClient(c, o)
+		if err != nil {
+			return err
+		}
 		if err := cl.Delete(context.Background(), o.GetName(), metav1.DeleteOptions{GracePeriodSeconds: ptr.Of(int64(0))}); err != nil {
 			if errors.IsNotFound(err) {
 				return nil
 			}
 			return err
 		}
-		scope.Debugf("deleted resource: %s/%s/%s", gvr, o.GetName(), o.GetNamespace())
+		scope.Debugf("deleted resource: %s/%s/%s", o.GetObjectKind().GroupVersionKind(), o.GetName(), o.GetNamespace())
 		return nil
 	}
 	cl := kubeclient.GetWriteClient[T](c, o.GetNamespace()).(API[T])
@@ -473,6 +503,9 @@ func (c *Client) CreateServiceAccountToken(aud, ns, serviceAccount string) (stri
 }
 
 func toUnstructured(o runtime.Object) *unstructured.Unstructured {
+	if u, ok := o.(*unstructured.Unstructured); ok {
+		return u.DeepCopy()
+	}
 	unsObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
 	if err != nil {
 		return nil

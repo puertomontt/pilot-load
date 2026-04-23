@@ -30,7 +30,7 @@ func NewKubeGateway(s KubeGatewaySpec) *KubeGateway {
 }
 
 func (v *KubeGateway) Run(ctx model.Context) (err error) {
-	return kube.Apply(ctx.Client, v.getGateway())
+	return kube.ApplyRealSSA(ctx.Client, v.getGateway())
 }
 
 func (v *KubeGateway) Cleanup(ctx model.Context) error {

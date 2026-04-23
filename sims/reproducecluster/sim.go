@@ -2,9 +2,11 @@ package reproducecluster
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -21,9 +23,11 @@ import (
 	"istio.io/istio/pkg/util/sets"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	yamlserializer "k8s.io/apimachinery/pkg/runtime/serializer/yaml"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
@@ -84,6 +88,7 @@ func toK8s(g config.GroupVersionKind) schema.GroupVersionKind {
 
 var order = []ApiDetails{
 	{toK8s(gvk.Namespace), false},
+	{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, false},
 	{toK8s(gvk.EnvoyFilter), true},
 	{toK8s(gvk.Telemetry), true},
 	{toK8s(gvk.ServiceEntry), true},
@@ -111,88 +116,17 @@ func (i *ReproduceSimulation) Run(ctx model.Context) error {
 		return err
 	}
 	total := 0
-	for _, g := range order {
+	for _, g := range append(order, extraOrder(cfgsByKind)...) {
 		cfg := cfgsByKind[g.gvk]
 		for _, c := range cfg {
 			if util.IsDone(ctx) {
 				return nil
 			}
-			co := c.DeepCopyObject().(metav1.Object)
-			ns := co.GetNamespace()
-			name := co.GetName()
-			kind := c.GetObjectKind().GroupVersionKind().Kind
-			if shouldSkipResource(ns, name, kind, g.isIstioApi) {
-				continue
+			created, err := i.applyResource(ctx, c, g.isIstioApi)
+			if err != nil {
+				return err
 			}
-
-			if kind == gvk.Pod.Kind && !i.Spec.ConfigOnly {
-				pod := co.(*v1.Pod)
-				x := &xds.Simulation{
-					Labels:         co.GetLabels(),
-					Namespace:      co.GetNamespace(),
-					Name:           co.GetName(),
-					ServiceAccount: pod.Spec.ServiceAccountName,
-					IP:             pod.Status.PodIP,
-					AppType:        model.SidecarType,
-					Cluster:        "Kubernetes",
-					GrpcOpts:       ctx.Args.Auth.GrpcOptions(pod.Spec.ServiceAccountName, co.GetNamespace()),
-					Delta:          ctx.Args.DeltaXDS,
-				}
-				i.sims = append(i.sims, x)
-				if err := x.Run(ctx); err != nil {
-					return err
-				}
-				util.ContextSleep(ctx, i.Spec.Delay)
-				continue
-			}
-
-			co.SetResourceVersion("")
-			co.SetManagedFields(nil)
-			co.SetCreationTimestamp(metav1.Time{})
-			co.SetFinalizers(nil)
-			if svc, ok := co.(*v1.Service); ok {
-				// Mutate Service
-				spec := svc.Spec
-				// Wipe out Cluster IP, we can get one assigned
-				if spec.ClusterIP != "None" {
-					spec.ClusterIP = ""
-					spec.ClusterIPs = nil
-				}
-				// Same impact, a lot cheaper
-				if spec.Type == v1.ServiceTypeLoadBalancer {
-					spec.Type = v1.ServiceTypeNodePort
-				}
-				// We managed endpoint ourself
-				spec.Selector = nil
-				svc.Spec = spec
-			}
-			if ep, ok := co.(*v1.Endpoints); ok {
-				subsets := ep.Subsets
-				for i := range subsets {
-					for a := range subsets[i].Addresses {
-						// Pod won't exist, so wipe it out
-						subsets[i].Addresses[a].TargetRef = nil
-					}
-				}
-				ep.Subsets = subsets
-			}
-			if sa, ok := co.(*v1.ServiceAccount); ok {
-				// Annotations can configure dependencies like WI
-				sa.SetAnnotations(nil)
-				sa.SetLabels(nil)
-			}
-			s := newCreateSim(co.(controllers.Object))
-			i.sims = append(i.sims, s)
-			if err := s.Run(ctx); err != nil {
-				// Ignore errors
-				log.Errorf("failed to create resource: %v", err)
-			}
-			if s.skipCleanup {
-				log.Infof("already exists: %v/%v.%v", kind, name, ns)
-			} else {
-				total++
-				log.Infof("created: %v/%v.%v", kind, name, ns)
-			}
+			total += created
 		}
 	}
 	log.Infof("All configs create (%d total)", total)
@@ -208,16 +142,18 @@ func (i *ReproduceSimulation) Running() chan struct{} {
 	return i.running
 }
 
-func parseInputs(inputFile string) (map[schema.GroupVersionKind][]runtime.Object, error) {
+func parseInputs(inputFile string) (map[schema.GroupVersionKind][]controllers.Object, error) {
 	f, err := os.Open(inputFile)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	codecs := serializer.NewCodecFactory(IstioScheme)
 	deserializer := codecs.UniversalDeserializer()
+	unstructuredDeserializer := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
 	reader := yaml.NewYAMLReader(bufio.NewReader(f))
-	resp := map[schema.GroupVersionKind][]runtime.Object{}
+	resp := map[schema.GroupVersionKind][]controllers.Object{}
 	for {
 		chunk, err := reader.Read()
 		if err == io.EOF {
@@ -226,10 +162,13 @@ func parseInputs(inputFile string) (map[schema.GroupVersionKind][]runtime.Object
 		if err != nil {
 			return nil, err
 		}
-		var obj runtime.Object
-		obj, _, err = deserializer.Decode(chunk, nil, obj)
+		if len(bytes.TrimSpace(chunk)) == 0 {
+			continue
+		}
+
+		obj, err := decodeInputObject(chunk, deserializer, unstructuredDeserializer)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse message: %v", err)
+			return nil, err
 		}
 		gvk := obj.GetObjectKind().GroupVersionKind()
 
@@ -244,6 +183,170 @@ func parseInputs(inputFile string) (map[schema.GroupVersionKind][]runtime.Object
 	}
 
 	return resp, nil
+}
+
+func decodeInputObject(chunk []byte, deserializer runtime.Decoder, unstructuredDeserializer runtime.Decoder) (controllers.Object, error) {
+	obj, _, err := deserializer.Decode(chunk, nil, nil)
+	if err == nil {
+		return obj.(controllers.Object), nil
+	}
+
+	raw := &unstructured.Unstructured{}
+	obj, gvk, unstructuredErr := unstructuredDeserializer.Decode(chunk, nil, raw)
+	if unstructuredErr != nil {
+		return nil, fmt.Errorf("cannot parse message: %v", err)
+	}
+	if gvk != nil {
+		raw.SetGroupVersionKind(*gvk)
+	}
+	return obj.(controllers.Object), nil
+}
+
+func extraOrder(cfgsByKind map[schema.GroupVersionKind][]controllers.Object) []ApiDetails {
+	known := make(map[schema.GroupVersionKind]struct{}, len(order))
+	for _, g := range order {
+		known[g.gvk] = struct{}{}
+	}
+
+	extra := make([]ApiDetails, 0, len(cfgsByKind))
+	for gvk := range cfgsByKind {
+		if _, f := known[gvk]; f {
+			continue
+		}
+		extra = append(extra, ApiDetails{
+			gvk:        gvk,
+			isIstioApi: isIstioAPI(gvk),
+		})
+	}
+
+	sort.Slice(extra, func(i, j int) bool {
+		return compareGVK(extra[i].gvk, extra[j].gvk) < 0
+	})
+	return extra
+}
+
+func compareGVK(a, b schema.GroupVersionKind) int {
+	if ap, bp := resourcePriority(a), resourcePriority(b); ap != bp {
+		return ap - bp
+	}
+	if a.Group != b.Group {
+		if a.Group < b.Group {
+			return -1
+		}
+		return 1
+	}
+	if a.Version != b.Version {
+		if a.Version < b.Version {
+			return -1
+		}
+		return 1
+	}
+	if a.Kind < b.Kind {
+		return -1
+	}
+	if a.Kind > b.Kind {
+		return 1
+	}
+	return 0
+}
+
+func resourcePriority(gvk schema.GroupVersionKind) int {
+	if isCRD(gvk) {
+		return 0
+	}
+	return 1
+}
+
+func isCRD(gvk schema.GroupVersionKind) bool {
+	return gvk.Group == "apiextensions.k8s.io" && gvk.Version == "v1" && gvk.Kind == "CustomResourceDefinition"
+}
+
+func isIstioAPI(gvk schema.GroupVersionKind) bool {
+	_, exists := collections.All.FindByGroupVersionAliasesKind(resource.FromKubernetesGVK(&gvk))
+	return exists
+}
+
+func (i *ReproduceSimulation) applyResource(ctx model.Context, obj controllers.Object, isIstioApi bool) (int, error) {
+	co := obj.DeepCopyObject().(controllers.Object)
+	ns := co.GetNamespace()
+	name := co.GetName()
+	kind := co.GetObjectKind().GroupVersionKind().Kind
+	if shouldSkipResource(ns, name, kind, isIstioApi) {
+		return 0, nil
+	}
+
+	if kind == gvk.Pod.Kind && !i.Spec.ConfigOnly {
+		pod, ok := co.(*v1.Pod)
+		if !ok {
+			return 0, fmt.Errorf("pod object decoded as %T", co)
+		}
+		x := &xds.Simulation{
+			Labels:         co.GetLabels(),
+			Namespace:      co.GetNamespace(),
+			Name:           co.GetName(),
+			ServiceAccount: pod.Spec.ServiceAccountName,
+			IP:             pod.Status.PodIP,
+			AppType:        model.SidecarType,
+			Cluster:        "Kubernetes",
+			GrpcOpts:       ctx.Args.Auth.GrpcOptions(pod.Spec.ServiceAccountName, co.GetNamespace()),
+			Delta:          ctx.Args.DeltaXDS,
+		}
+		i.sims = append(i.sims, x)
+		if err := x.Run(ctx); err != nil {
+			return 0, err
+		}
+		util.ContextSleep(ctx, i.Spec.Delay)
+		return 0, nil
+	}
+
+	co.SetResourceVersion("")
+	co.SetManagedFields(nil)
+	co.SetCreationTimestamp(metav1.Time{})
+	co.SetFinalizers(nil)
+	if svc, ok := co.(*v1.Service); ok {
+		// Mutate Service
+		spec := svc.Spec
+		// Wipe out Cluster IP, we can get one assigned
+		if spec.ClusterIP != "None" {
+			spec.ClusterIP = ""
+			spec.ClusterIPs = nil
+		}
+		// Same impact, a lot cheaper
+		if spec.Type == v1.ServiceTypeLoadBalancer {
+			spec.Type = v1.ServiceTypeNodePort
+		}
+		// We managed endpoint ourself
+		spec.Selector = nil
+		svc.Spec = spec
+	}
+	if ep, ok := co.(*v1.Endpoints); ok {
+		subsets := ep.Subsets
+		for i := range subsets {
+			for a := range subsets[i].Addresses {
+				// Pod won't exist, so wipe it out
+				subsets[i].Addresses[a].TargetRef = nil
+			}
+		}
+		ep.Subsets = subsets
+	}
+	if sa, ok := co.(*v1.ServiceAccount); ok {
+		// Annotations can configure dependencies like WI
+		sa.SetAnnotations(nil)
+		sa.SetLabels(nil)
+	}
+	s := newCreateSim(co)
+	i.sims = append(i.sims, s)
+	if err := s.Run(ctx); err != nil {
+		// Ignore errors
+		log.Errorf("failed to create resource: %v", err)
+		return 0, nil
+	}
+	if s.skipCleanup {
+		log.Infof("already exists: %v/%v.%v", kind, name, ns)
+		return 0, nil
+	}
+	log.Infof("created: %v/%v.%v", kind, name, ns)
+	return 1, nil
 }
 
 // IstioScheme returns a scheme will all known Istio-related types added
