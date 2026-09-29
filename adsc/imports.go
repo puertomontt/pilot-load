@@ -5,7 +5,6 @@ package adsc
 import (
 	udpa "github.com/cncf/udpa/go/udpa/type/v1"
 	_ "istio.io/api/envoy/config/filter/http/alpn/v2alpha1"
-	_ "istio.io/api/envoy/config/filter/network/metadata_exchange"
 	_ "istio.io/istio/pkg/config/xds"
 )
 
